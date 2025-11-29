@@ -280,11 +280,18 @@ class GriffinBlock(nn.Module):
     def forward(self, h: torch.Tensor, inject: Optional[torch.Tensor] = None, cos_sin=None):
         x = self.norm1(h)
         if inject is not None:
-            if inject.dim() == 2:
-                inject = inject.unsqueeze(1)
+            inject_tensor = inject
+            if inject_tensor.dim() == 2:
+                inject_tensor = inject_tensor.unsqueeze(1)
             if self.inject_proj is not None:
-                inject = self.inject_proj(inject)
-            x = x + inject
+                inject_tensor = self.inject_proj(inject_tensor)
+            
+            if h.dim() != inject_tensor.dim():
+                if h.dim() == 2 and inject_tensor.dim() == 3:
+                    h = h.unsqueeze(1).expand(-1, inject_tensor.shape[1], -1)
+                    x = self.norm1(h)
+            
+            x = x + inject_tensor
         attn_out = self.attn(hidden_states=x, cos_sin=cos_sin)
         h = h + attn_out
         mlp_out = self.mlp(self.norm2(h))
@@ -762,9 +769,14 @@ class MurderTreeV2Core(nn.Module):
                 noise_scale, use_slow_critic, device
             )
 
-        t1_out_proj = self.down1(t1_out.mean(1) if t1_out.dim() == 3 else t1_out)
-        t2_out_proj = self.down2(t2_out.mean(1) if t2_out.dim() == 3 else t2_out)
-        t3_out_proj = self.down3(candidates.mean(1) if candidates.dim() == 3 else candidates)
+        # t1_out, t2_out, candidates are [count, B, T, d] - reduce to [B, d] for projection
+        t1_out_reduced = t1_out.mean(0) if t1_out.dim() == 4 else (t1_out.mean(1) if t1_out.dim() == 3 else t1_out)
+        t2_out_reduced = t2_out.mean(0) if t2_out.dim() == 4 else (t2_out.mean(1) if t2_out.dim() == 3 else t2_out)
+        t3_out_reduced = candidates.mean(0) if candidates.dim() == 4 else (candidates.mean(1) if candidates.dim() == 3 else candidates)
+        
+        t1_out_proj = self.down1(t1_out_reduced)
+        t2_out_proj = self.down2(t2_out_reduced)
+        t3_out_proj = self.down3(t3_out_reduced)
 
         return new_h, logits, (q_halt, q_cont), value, new_policy, t1_out_proj, t2_out_proj, t3_out_proj
 
@@ -810,12 +822,22 @@ class HierarchicalReasoningModel_ACTV2(nn.Module):
         new_h, logits, (q_halt, q_cont), value, new_policy, t1_out, t2_out, t3_out = self.core(inner, batch["inputs"])
         
         T = batch["inputs"].shape[1]
+        
+        # t1_out, t2_out, t3_out are [B, d] or [B, T, d] - expand to [count, B, T, d]
         if t1_out.dim() == 2:
-            t1_out = t1_out.unsqueeze(2).expand(-1, -1, T, -1)
+            t1_out = t1_out.unsqueeze(0).unsqueeze(2).expand(self.cfg.tier1_count, -1, T, -1)
+        elif t1_out.dim() == 3:
+            t1_out = t1_out.unsqueeze(0).expand(self.cfg.tier1_count, -1, -1, -1)
+        
         if t2_out.dim() == 2:
-            t2_out = t2_out.unsqueeze(2).expand(-1, -1, T, -1)
+            t2_out = t2_out.unsqueeze(0).unsqueeze(2).expand(self.cfg.tier2_count, -1, T, -1)
+        elif t2_out.dim() == 3:
+            t2_out = t2_out.unsqueeze(0).expand(self.cfg.tier2_count, -1, -1, -1)
+        
         if t3_out.dim() == 2:
-            t3_out = t3_out.unsqueeze(2).expand(-1, -1, T, -1)
+            t3_out = t3_out.unsqueeze(0).unsqueeze(2).expand(self.cfg.tier3_count, -1, T, -1)
+        elif t3_out.dim() == 3:
+            t3_out = t3_out.unsqueeze(0).expand(self.cfg.tier3_count, -1, -1, -1)
         
         new_z_H = torch.cat([t1_out, t2_out, t3_out], dim=0)
 
@@ -910,7 +932,6 @@ def test_enhanced_evolution():
         max_evolutions = carry.inner_carry.evolution_mask.sum(dim=0).max().item()
         assert max_evolutions <= 3, f"Too many inference evolutions: {max_evolutions}"
     
-    return True
     return True
 
 if __name__ == "__main__":
